@@ -25,9 +25,7 @@ public class Db {
     }
 
     public static void savePaper(String title, String authors, String content, String url) {
-        String sql = "INSERT INTO Pages(title, authors, content, url) VALUES(?,?,?,?) " +
-                "ON CONFLICT (url) DO UPDATE SET " +
-                "title = EXCLUDED.title, authors = EXCLUDED.authors, content = EXCLUDED.content";
+        String sql = "INSERT INTO Pages(title, authors, content, url) VALUES(?,?,?,?) ";
 
         try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASSWORD);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {

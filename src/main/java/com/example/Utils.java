@@ -36,11 +36,9 @@ public class Utils {
         try {
             Document doc = Jsoup.connect(url).get();
 
-            // Extract title
             String title = doc.select("h1").text();
             pageData.setTitle(title);
 
-            // Extract authors
             Elements authorElements = doc.select(".ltx_personname");
             StringBuilder authorsBuilder = new StringBuilder();
             if (!authorElements.isEmpty()) {
