@@ -1,40 +1,30 @@
 package com.example;
 
 import java.util.List;
-import java.util.ArrayList;
+import java.util.concurrent.CompletableFuture;
 
 public class Main {
+    private static final List<String> CATEGORIES = List.of("cs.AI", "cs.CL", "cs.LG", "cs.CV", "cs.NE");
+    private static final int MAX_PAPERS_PER_CATEGORY = 100;
+
     public static void main(String[] args) {
         Db.initialize();
-
-        List<String> categoryUrls = new ArrayList<>();
-        categoryUrls.add("https://arxiv.org/list/cs.SE/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.AI/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.CL/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.CV/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.SY/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.DB/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.IR/recent");
-        categoryUrls.add("https://arxiv.org/list/cs.GT/recent");
-
         long startTime = System.currentTimeMillis();
 
-        List<String> arxivLinks = new ArrayList<>();
-        for (String categoryUrl : categoryUrls) {
-            arxivLinks.addAll(Utils.getArxivHtmlLinks(categoryUrl));
-        }
+        CompletableFuture<Void> processingFuture = Utils.fetchAndProcessAll(CATEGORIES, MAX_PAPERS_PER_CATEGORY)
+                .thenRun(() -> {
+                    long endTime = System.currentTimeMillis();
+                    double elapsedTime = (endTime - startTime) / 1000.0;
+                    System.out.println("All papers processed and saved to database.");
+                    System.out.printf("Elapsed time: %.2f seconds%n", elapsedTime);
+                })
+                .exceptionally(ex -> {
+                    System.err.println("Error in processing: " + ex.getMessage());
+                    ex.printStackTrace();
+                    return null;
+                });
 
-        for (String url : arxivLinks) {
-            PageData paperData = Utils.processArxivDocument(url);
-            Db.savePaper(paperData.getTitle(),
-                    paperData.getAuthors(),
-                    paperData.getContent(),
-                    paperData.getUrl());
-        }
+        processingFuture.join();
 
-        System.out.println("Results saved in database");
-        long endTime = System.currentTimeMillis();
-        long elapsedTime = (endTime - startTime)/1000;
-        System.out.println("Elapsed time: " + elapsedTime + " seconds");
     }
 }

@@ -4,29 +4,87 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
+
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
 public class Utils {
-    public static List<String> getArxivHtmlLinks(String url) {
-        List<String> htmlLinks = new ArrayList<>();
+    private static final String ARXIV_API_URL = "http://export.arxiv.org/api/query?";
+    private static final int MAX_RESULTS = 100;
 
-        try {
-            Document doc = Jsoup.connect(url).get();
-            Elements links = doc.select("a[href^=/abs/]");
+    public static CompletableFuture<Void> fetchAndProcessAll(List<String> categories, int maxPapersPerCategory) {
+        return CompletableFuture.supplyAsync(() ->
+                        categories.parallelStream()
+                                .map(cat -> fetchPapersFromCategoryAsync(cat, maxPapersPerCategory))
+                                .collect(Collectors.toList()))
+                .thenCompose(futures -> {
+                    CompletableFuture<Void> allOf = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+                    return allOf.thenApply(v ->
+                            futures.stream()
+                                    .flatMap(f -> f.join().stream())
+                                    .collect(Collectors.toList())
+                    );
+                })
+                .thenCompose(Utils::processAllPapersAsync);
+    }
 
-            for (Element link : links) {
-                String paperId = link.attr("href").replace("/abs/", "");
-                String htmlUrl = "https://arxiv.org/html/" + paperId;
-                htmlLinks.add(htmlUrl);
+    public static CompletableFuture<List<String>> fetchPapersFromCategoryAsync(String category, int maxPapers) {
+        return CompletableFuture.supplyAsync(() -> {
+            List<String> links = new ArrayList<>();
+            int start = 0;
+            int totalResults = 0;
+
+            try {
+                while (true) {
+                    String query = String.format("search_query=cat:%s&start=%d&max_results=%d&sortBy=submittedDate&sortOrder=descending",
+                            category, start, MAX_RESULTS);
+                    Document doc = Jsoup.connect(ARXIV_API_URL + query).get();
+                    Elements entries = doc.select("entry");
+
+                    if (entries.isEmpty()) break;
+
+                    for (Element entry : entries) {
+                        if (maxPapers > 0 && totalResults >= maxPapers) break;
+                        String id = entry.select("id").text();
+                        String paperId = id.substring(id.lastIndexOf('/') + 1);
+                        links.add("https://arxiv.org/html/" + paperId);
+                        totalResults++;
+                    }
+
+                    if (entries.size() < MAX_RESULTS || (maxPapers > 0 && totalResults >= maxPapers)) {
+                        break;
+                    }
+
+                    start += MAX_RESULTS;
+                    Thread.sleep(3000);
+                }
+            } catch (IOException | InterruptedException e) {
+                System.err.println("Error fetching from " + category + ": " + e.getMessage());
             }
 
-        } catch (IOException e) {
-            System.out.println("Error: " + e.getMessage());
-        }
+            System.out.printf("Fetched %d papers from category %s%n", links.size(), category);
+            return links;
+        });
+    }
 
-        return htmlLinks;
+    public static CompletableFuture<Void> processAllPapersAsync(List<String> urls) {
+        List<CompletableFuture<Void>> futures = urls.stream()
+                .map(url -> CompletableFuture.supplyAsync(() -> processArxivDocument(url))
+                        .thenAccept(paperData -> {
+                            if (paperData != null) {
+                                Db.savePaper(
+                                        paperData.getTitle(),
+                                        paperData.getAuthors(),
+                                        paperData.getContent(),
+                                        paperData.getUrl()
+                                );
+                            }
+                        })
+                ).collect(Collectors.toList());
+
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
     }
 
     public static PageData processArxivDocument(String url) {
@@ -41,22 +99,16 @@ public class Utils {
 
             Elements authorElements = doc.select(".ltx_personname");
             StringBuilder authorsBuilder = new StringBuilder();
-            if (!authorElements.isEmpty()) {
-                for (int i = 0; i < authorElements.size(); i++) {
-                    authorElements.get(i).select("sup").remove();
-                    String author = authorElements.get(i).text().trim();
-                    author = author.replaceAll("[0-9,]", "");
-                    authorsBuilder.append(author);
-                    if (i < authorElements.size() - 1) {
-                        authorsBuilder.append(", ");
-                    }
+            for (int i = 0; i < authorElements.size(); i++) {
+                authorElements.get(i).select("sup").remove();
+                String author = authorElements.get(i).text().trim().replaceAll("[0-9,]", "");
+                authorsBuilder.append(author);
+                if (i < authorElements.size() - 1) {
+                    authorsBuilder.append(", ");
                 }
-                pageData.setAuthors(authorsBuilder.toString());
-            } else {
-                pageData.setAuthors("Not found");
             }
+            pageData.setAuthors(authorsBuilder.length() > 0 ? authorsBuilder.toString() : "Not found");
 
-            // Extract content
             StringBuilder contentBuilder = new StringBuilder();
             Elements headers = doc.select("h1, h2, h3, h4, h5, h6");
 
@@ -68,21 +120,19 @@ public class Utils {
                     Element nextElement = header.nextElementSibling();
                     if (sectionTitle.toLowerCase().contains("reference") ||
                             sectionTitle.toLowerCase().contains("bibliography")) {
-                        while (nextElement != null && !nextElement.is("h1, h2, h3, h4, h5, h6")) {
+                        while (nextElement != null && !nextElement.tagName().matches("h[1-6]")) {
                             if (nextElement.is("ul.ltx_biblist")) {
                                 Elements referenceItems = nextElement.select("li");
                                 for (Element ref : referenceItems) {
-                                    String reference = ref.text().trim();
-                                    contentBuilder.append("    - ").append(reference).append("\n");
+                                    contentBuilder.append("    - ").append(ref.text().trim()).append("\n");
                                 }
                             }
                             nextElement = nextElement.nextElementSibling();
                         }
                     } else {
-                        while (nextElement != null && !nextElement.is("h1, h2, h3, h4, h5, h6")) {
+                        while (nextElement != null && !nextElement.tagName().matches("h[1-6]")) {
                             if (nextElement.is("div") || nextElement.is("p") || nextElement.is("span")) {
-                                String paragraph = nextElement.text();
-                                contentBuilder.append("    ").append(paragraph).append("\n");
+                                contentBuilder.append("    ").append(nextElement.text()).append("\n");
                             }
                             nextElement = nextElement.nextElementSibling();
                         }
