@@ -6,85 +6,88 @@ import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
 import java.io.IOException;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 public class Utils {
     private static final String ARXIV_API_URL = "http://export.arxiv.org/api/query?";
     private static final int MAX_RESULTS = 100;
+    private static final ExecutorService virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
-    public static CompletableFuture<Void> fetchAndProcessAll(List<String> categories, int maxPapersPerCategory) {
-        return CompletableFuture.supplyAsync(() ->
-                        categories.parallelStream()
-                                .map(cat -> fetchPapersFromCategoryAsync(cat, maxPapersPerCategory))
-                                .collect(Collectors.toList()))
-                .thenCompose(futures -> {
-                    CompletableFuture<Void> allOf = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
-                    return allOf.thenApply(v ->
-                            futures.stream()
-                                    .flatMap(f -> f.join().stream())
-                                    .collect(Collectors.toList())
-                    );
-                })
-                .thenCompose(Utils::processAllPapersAsync);
+    public static void fetchAndProcessAll(List<String> categories, int maxPapersPerCategory) throws InterruptedException, ExecutionException {
+        List<String> allUrls = new ArrayList<>();
+
+        List<Thread> fetchThreads = categories.stream()
+                .map(category -> Thread.ofVirtual().start(() -> {
+                    List<String> urls = fetchPapersFromCategory(category, maxPapersPerCategory);
+                    synchronized (allUrls) {
+                        allUrls.addAll(urls);
+                    }
+                }))
+                .collect(Collectors.toList());
+
+        for (Thread thread : fetchThreads) {
+            thread.join();
+        }
+
+        List<Thread> processThreads = allUrls.stream()
+                .map(url -> Thread.ofVirtual().start(() -> {
+                    PageData paperData = processArxivDocument(url);
+                    if (paperData != null) {
+                        Db.savePaper(
+                                paperData.getTitle(),
+                                paperData.getAuthors(),
+                                paperData.getContent(),
+                                paperData.getUrl()
+                        );
+                    }
+                }))
+                .collect(Collectors.toList());
+
+        for (Thread thread : processThreads) {
+            thread.join();
+        }
     }
 
-    public static CompletableFuture<List<String>> fetchPapersFromCategoryAsync(String category, int maxPapers) {
-        return CompletableFuture.supplyAsync(() -> {
-            List<String> links = new ArrayList<>();
-            int start = 0;
-            int totalResults = 0;
+    public static List<String> fetchPapersFromCategory(String category, int maxPapers) {
+        List<String> links = new ArrayList<>();
+        int start = 0;
+        int totalResults = 0;
 
-            try {
-                while (true) {
-                    String query = String.format("search_query=cat:%s&start=%d&max_results=%d&sortBy=submittedDate&sortOrder=descending",
-                            category, start, MAX_RESULTS);
-                    Document doc = Jsoup.connect(ARXIV_API_URL + query).get();
-                    Elements entries = doc.select("entry");
+        try {
+            while (true) {
+                String query = String.format("search_query=cat:%s&start=%d&max_results=%d&sortBy=submittedDate&sortOrder=descending",
+                        category, start, MAX_RESULTS);
+                Document doc = Jsoup.connect(ARXIV_API_URL + query).get();
+                Elements entries = doc.select("entry");
 
-                    if (entries.isEmpty()) break;
+                if (entries.isEmpty()) break;
 
-                    for (Element entry : entries) {
-                        if (maxPapers > 0 && totalResults >= maxPapers) break;
-                        String id = entry.select("id").text();
-                        String paperId = id.substring(id.lastIndexOf('/') + 1);
-                        links.add("https://arxiv.org/html/" + paperId);
-                        totalResults++;
-                    }
-
-                    if (entries.size() < MAX_RESULTS || (maxPapers > 0 && totalResults >= maxPapers)) {
-                        break;
-                    }
-
-                    start += MAX_RESULTS;
-                    Thread.sleep(3000);
+                for (Element entry : entries) {
+                    if (maxPapers > 0 && totalResults >= maxPapers) break;
+                    String id = entry.select("id").text();
+                    String paperId = id.substring(id.lastIndexOf('/') + 1);
+                    links.add("https://arxiv.org/html/" + paperId);
+                    totalResults++;
                 }
-            } catch (IOException | InterruptedException e) {
-                System.err.println("Error fetching from " + category + ": " + e.getMessage());
+
+                if (entries.size() < MAX_RESULTS || (maxPapers > 0 && totalResults >= maxPapers)) {
+                    break;
+                }
+
+                start += MAX_RESULTS;
+                Thread.sleep(3000);
             }
+        } catch (IOException | InterruptedException e) {
+            System.err.println("Error fetching from " + category + ": " + e.getMessage());
+        }
 
-            System.out.printf("Fetched %d papers from category %s%n", links.size(), category);
-            return links;
-        });
-    }
-
-    public static CompletableFuture<Void> processAllPapersAsync(List<String> urls) {
-        List<CompletableFuture<Void>> futures = urls.stream()
-                .map(url -> CompletableFuture.supplyAsync(() -> processArxivDocument(url))
-                        .thenAccept(paperData -> {
-                            if (paperData != null) {
-                                Db.savePaper(
-                                        paperData.getTitle(),
-                                        paperData.getAuthors(),
-                                        paperData.getContent(),
-                                        paperData.getUrl()
-                                );
-                            }
-                        })
-                ).collect(Collectors.toList());
-
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        System.out.printf("Fetched %d papers from category %s%n", links.size(), category);
+        return links;
     }
 
     public static PageData processArxivDocument(String url) {
